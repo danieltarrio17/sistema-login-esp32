@@ -1,229 +1,226 @@
-// ==========================================
-// FICHEIRO: src/main.cpp
-// ==========================================
 #include <Arduino.h>
-#include <SPI.h>
-#include <MFRC522.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Preferences.h> // A nossa "Base de Dados" Offline
-#include "Config.h"
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Preferences.h>
+#include "mbedtls/md.h"
 
 // ==========================================
-// PROTÓTIPOS DE FUNÇÃO
+// CONFIGURAÇÕES DE REDE E SEGURANÇA
 // ==========================================
-void conectarWiFi();
-bool verificarAcessoAPI(String uidCartao);
-void guardarNaCache(String uidCartao);
-bool verificarAcessoOffline(String uidCartao);
-void executarAcao(bool autorizado, bool offline);
-void gerirFechadura();
-void monitorizarPortaFisica();
-void atualizarEcra(String linha1, String linha2);
+const char* ssid = "devolo-319";
+const char* password = "DTHYQGNSRKXUTHKN";
+
+// Substitui pelo IP do teu computador onde o Node.js está a correr
+const String SERVER_URL = "http://192.168.1.70:3000/api/check-access";
+const String ALARM_URL = "http://192.168.1.70:3000/api/alarms";
+
+// A NOSSA CHAVE DE CIBERSEGURANÇA (Para evitar Replay Attacks)
+const String API_KEY = "CHAVE_ULTRA_SECRETA_ESP32_2026";
 
 // ==========================================
-// VARIÁVEIS GLOBAIS
+// CONFIGURAÇÕES DE HARDWARE (PINOS)
 // ==========================================
+#define SS_PIN 5        // Pino SDA/SS do RFID
+#define RST_PIN 22      // Pino RST do RFID
+#define RELAY_PIN 15    // Pino do Relé (Fechadura)
+#define REED_SWITCH 4   // Pino do Sensor Magnético de Porta
+
 MFRC522 rfid(SS_PIN, RST_PIN);
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
-Preferences preferencias; // Objeto para gerir a memória Flash
+Preferences cacheMemoria; // Gestor de memória interna para o Modo Offline
 
-enum EstadoSistema { IDLE, VALIDACAO, ACAO };
-EstadoSistema estadoAtual = IDLE;
-
+// Variáveis de Estado da Porta
+bool portaAutorizada = false;
 unsigned long tempoAbertura = 0;
-bool portaDestrancada = false;
+const unsigned long TEMPO_DESTRANCADA = 5000; // 5 segundos aberta
+bool alarmeAtivo = false;
 
+// ==========================================
+// 1. FUNÇÃO DE CRIPTOGRAFIA MILITAR (SHA-256)
+// ==========================================
+String calcularSHA256(String input) {
+    byte shaResult[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, (const unsigned char *) input.c_str(), input.length());
+    mbedtls_md_finish(&ctx, shaResult);
+    mbedtls_md_free(&ctx);
+
+    String hashString = "";
+    for (int i = 0; i < 32; i++) {
+        char str[3];
+        sprintf(str, "%02x", (int)shaResult[i]);
+        hashString += str;
+    }
+    return hashString; // Retorna algo como "e3b0c44298fc..."
+}
+
+// ==========================================
+// 2. GESTÃO DO MODO DEGRADADO (OFFLINE CACHE)
+// ==========================================
+void guardarHashNaCache(String hashUID) {
+    cacheMemoria.begin("acessos", false);
+    int indiceAtual = cacheMemoria.getInt("indice", 0);
+
+    // Verifica se já existe para não repetir
+    bool existe = false;
+    for(int i = 0; i < 10; i++) {
+        if(cacheMemoria.getString(String("h" + String(i)).c_str(), "") == hashUID) {
+            existe = true; break;
+        }
+    }
+
+    // Se é um cartão novo autorizado, guarda o Hash no espaço atual e avança o índice (Rotativo de 10)
+    if(!existe) {
+        cacheMemoria.putString(String("h" + String(indiceAtual)).c_str(), hashUID);
+        indiceAtual = (indiceAtual + 1) % 10;
+        cacheMemoria.putInt("indice", indiceAtual);
+        Serial.println("🛡️ Hash criptográfico guardado na cache local.");
+    }
+    cacheMemoria.end();
+}
+
+bool verificarAcessoOffline(String hashUID) {
+    cacheMemoria.begin("acessos", true); // Modo leitura
+    bool autorizado = false;
+    for(int i = 0; i < 10; i++) {
+        if(cacheMemoria.getString(String("h" + String(i)).c_str(), "") == hashUID) {
+            autorizado = true;
+            break;
+        }
+    }
+    cacheMemoria.end();
+    return autorizado;
+}
+
+// ==========================================
+// 3. CONTROLO FÍSICO
+// ==========================================
+void abrirPorta() {
+    Serial.println("🟢 ACESSO CONCEDIDO! A destrancar porta...");
+    digitalWrite(RELAY_PIN, HIGH);
+    portaAutorizada = true;
+    tempoAbertura = millis();
+}
+
+void trancarPortaAutomatica() {
+    if (portaAutorizada && (millis() - tempoAbertura > TEMPO_DESTRANCADA)) {
+        digitalWrite(RELAY_PIN, LOW);
+        portaAutorizada = false;
+        Serial.println("🔒 Porta trancada automaticamente.");
+    }
+}
+
+// O ALARME CONTRA ARROMBAMENTO FÍSICO
+void verificarSegurancaFisica() {
+    // Assume que a porta fechada tem o íman colado (LOW). Aberta = HIGH.
+    int estadoSensor = digitalRead(REED_SWITCH); 
+    
+    if (estadoSensor == HIGH && !portaAutorizada) {
+        if (!alarmeAtivo) {
+            Serial.println("🚨 INTRUSÃO DETETADA! PORTA ARROMBADA!");
+            alarmeAtivo = true;
+            
+            if (WiFi.status() == WL_CONNECTED) {
+                HTTPClient http;
+                http.begin(ALARM_URL);
+                http.addHeader("Content-Type", "application/json");
+                http.addHeader("x-api-key", API_KEY); // Usa a chave também no alarme!
+                http.POST("{}");
+                http.end();
+            }
+        }
+    } else if (estadoSensor == LOW) {
+        alarmeAtivo = false; // O alarme desliga quando fecham a porta
+    }
+}
+
+// ==========================================
+// SETUP E LOOP PRINCIPAL
+// ==========================================
 void setup() {
-  Serial.begin(115200);
-  
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
-  pinMode(REED_SWITCH_PIN, INPUT_PULLUP); 
+    Serial.begin(115200);
+    SPI.begin();
+    rfid.PCD_Init();
+    
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW); // Garante que arranca trancada
+    pinMode(REED_SWITCH, INPUT_PULLUP);
 
-  lcd.init();
-  lcd.backlight();
-  atualizarEcra("A Iniciar...", "");
+    WiFi.begin(ssid, password);
+    Serial.print("A ligar ao Wi-Fi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWi-Fi Ligado! Sistema Pronto.");
+}
 
-  SPI.begin();
-  rfid.PCD_Init();
-  
-  // Inicia a memória Flash criando uma "pasta" chamada "seguranca"
-  preferencias.begin("seguranca", false);
-  
-  conectarWiFi();
+void processarCartao(String uidLido) {
+    // 1. Gerar imediatamente a versão segura (Hash) do cartão
+    String hashDoCartao = calcularSHA256(uidLido);
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(SERVER_URL);
+        http.addHeader("Content-Type", "application/json");
+        
+        // A MAGIA ACONTECE AQUI: Injeção da Chave de API
+        http.addHeader("x-api-key", API_KEY); 
 
-  atualizarEcra("Sistema Pronto", "Aproxime o Cartao");
+        String payload = "{\"uid\":\"" + uidLido + "\"}";
+        int httpResponseCode = http.POST(payload);
+
+        if (httpResponseCode > 0) {
+            String resposta = http.getString();
+            if (resposta.indexOf("\"authorized\":true") > 0) {
+                abrirPorta();
+                guardarHashNaCache(hashDoCartao); // Salva o Hash para quando a NET falhar
+            } else {
+                Serial.println("🔴 ACESSO NEGADO pelo Servidor Central.");
+            }
+        } else {
+            // Se o Node.js estiver desligado, o POST falha (< 0)
+            Serial.println("Falha ao contactar servidor. A entrar em Modo Degradado (Offline)...");
+            if (verificarAcessoOffline(hashDoCartao)) {
+                abrirPorta();
+            } else {
+                Serial.println("🔴 ACESSO NEGADO na Cache Offline.");
+            }
+        }
+        http.end();
+    } else {
+        // Se a própria rede Wi-Fi foi abaixo
+        Serial.println("Sem Rede. A entrar em Modo Degradado (Offline)...");
+        if (verificarAcessoOffline(hashDoCartao)) {
+            abrirPorta();
+        } else {
+            Serial.println("🔴 ACESSO NEGADO na Cache Offline.");
+        }
+    }
 }
 
 void loop() {
-  monitorizarPortaFisica();
-  gerirFechadura(); 
+    trancarPortaAutomatica();
+    verificarSegurancaFisica();
 
-  switch (estadoAtual) {
-    case IDLE:
-      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-        estadoAtual = VALIDACAO;
-      }
-      break;
-
-    case VALIDACAO:
-      {
-        String uidLido = "";
+    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+        String uidFormatado = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
-          uidLido += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
-          uidLido += String(rfid.uid.uidByte[i], HEX);
+            uidFormatado += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+            uidFormatado += String(rfid.uid.uidByte[i], HEX);
         }
-        uidLido.toUpperCase();
+        uidFormatado.toUpperCase();
         
-        Serial.println("Cartao detetado: " + uidLido);
-        rfid.PICC_HaltA(); 
-        
-        bool autorizado = false;
-        bool modoOffline = false;
+        Serial.println("\nCartão lido fisicamente. A validar...");
+        processarCartao(uidFormatado);
 
-        // VERIFICA SE TEM INTERNET
-        if (WiFi.status() == WL_CONNECTED) {
-          atualizarEcra("A Validar...", "(Online)");
-          autorizado = verificarAcessoAPI(uidLido);
-          modoOffline = false;
-        } else {
-          // MODO DEGRADADO (OFFLINE)
-          atualizarEcra("A Validar...", "(Modo OFFLINE)");
-          autorizado = verificarAcessoOffline(uidLido);
-          modoOffline = true;
-        }
-
-        executarAcao(autorizado, modoOffline);
-        estadoAtual = IDLE; 
-      }
-      break;
-
-    case ACAO:
-      break;
-  }
-}
-
-// ==========================================
-// FUNÇÕES DE REDE E CACHE (O CÉREBRO)
-// ==========================================
-
-bool verificarAcessoAPI(String uidCartao) {
-  HTTPClient http;
-  http.begin(API_URL);
-  http.addHeader("Content-Type", "application/json");
-
-  String jsonPayload = "{\"uid\":\"" + uidCartao + "\"}";
-  int httpResponseCode = http.POST(jsonPayload);
-  bool acessoAutorizado = false;
-
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    if (response.indexOf("\"authorized\":true") > 0 || response.indexOf("\"authorized\": true") > 0) {
-      acessoAutorizado = true;
-      guardarNaCache(uidCartao); // <--- Guarda o cartão autorizado para quando a rede falhar!
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
     }
-  } else {
-    Serial.println("Erro no Servidor. A forçar verificação offline...");
-    return verificarAcessoOffline(uidCartao);
-  }
-  
-  http.end();
-  return acessoAutorizado;
-}
-
-void guardarNaCache(String uidCartao) {
-  // Vai buscar a lista de cartões já guardados
-  String cacheAtual = preferencias.getString("uids_validos", "");
-  
-  // Se o cartão ainda não está na lista, adiciona-o
-  if (cacheAtual.indexOf(uidCartao) == -1) {
-    // Evita que a memória encha infinitamente limitando a string
-    if (cacheAtual.length() > 200) cacheAtual = ""; 
-    
-    cacheAtual += uidCartao + ",";
-    preferencias.putString("uids_validos", cacheAtual);
-    Serial.println(">>> Cartao guardado na Cache Offline interna!");
-  }
-}
-
-bool verificarAcessoOffline(String uidCartao) {
-  String cacheAtual = preferencias.getString("uids_validos", "");
-  
-  if (cacheAtual.indexOf(uidCartao) >= 0) {
-    Serial.println(">>> Autorizado pela Memoria Interna (Sem Wi-Fi)!");
-    return true;
-  } else {
-    Serial.println(">>> Negado (Nao encontrado na memoria interna).");
-    return false;
-  }
-}
-
-void conectarWiFi() {
-  Serial.print("A ligar ao Wi-Fi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int tentativas = 0;
-  
-  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
-    delay(500);
-    Serial.print(".");
-    tentativas++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Conectado!");
-  } else {
-    Serial.println("\nFalha de Wi-Fi! A iniciar em MODO OFFLINE.");
-  }
-}
-
-void executarAcao(bool autorizado, bool offline) {
-  lcd.clear();
-  if (autorizado) {
-    lcd.print("Acesso Concedido");
-    if (offline) {
-      lcd.setCursor(0, 1);
-      lcd.print("(Usando Cache)");
-    }
-    digitalWrite(RELAY_PIN, LOW); 
-    portaDestrancada = true;
-    tempoAbertura = millis(); 
-  } else {
-    lcd.print("Acesso Negado!");
-    delay(2000); 
-    atualizarEcra("Sistema Pronto", "Aproxime o Cartao");
-  }
-}
-
-void gerirFechadura() {
-  if (portaDestrancada) {
-    if (millis() - tempoAbertura >= TEMPO_PORTA_ABERTA) {
-      digitalWrite(RELAY_PIN, HIGH); 
-      portaDestrancada = false;
-      atualizarEcra("Sistema Pronto", "Aproxime o Cartao");
-    }
-  }
-}
-
-void monitorizarPortaFisica() {
-  static bool estadoAnteriorPorta = LOW; 
-  bool estadoAtualPorta = digitalRead(REED_SWITCH_PIN);
-  
-  if (estadoAtualPorta != estadoAnteriorPorta) {
-    if (estadoAtualPorta == HIGH) {
-      Serial.println("ALERTA: Porta aberta fisicamente!");
-    }
-    estadoAnteriorPorta = estadoAtualPorta;
-    delay(50); 
-  }
-}
-
-void atualizarEcra(String linha1, String linha2) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(linha1);
-  lcd.setCursor(0, 1);
-  lcd.print(linha2);
 }
